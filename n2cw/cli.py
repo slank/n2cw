@@ -3,80 +3,34 @@
 A wrapper for nagios-style checks that pushes check status and
 perfdata to CloudWatch metrics.
 '''
-import botocore.session
-from argparse import ArgumentParser
+import sys
+from argparse import (
+    ArgumentParser,
+    Action,
+)
 from subprocess import (
     check_output,
     CalledProcessError,
 )
+from . import (
+    aws,
+    metrics,
+)
 
 
-class TestClient(object):
-    def __init__(self):
-        import logging
-        logging.basicConfig(level=logging.DEBUG)
-        self.log = logging.getLogger(name="Testing")
-
-    def put_metric_data(self, **kwargs):
-        self.log.debug(kwargs)
+class ParseKv(Action):
+    '''Parse key-value pairs from a string in the form key=value,key=value'''
+    def __call__(self, parser, namespace, values, option_string=None):
+        kv = getattr(namespace, self.dest, {})
+        kv.update(dict(p.split('=') for p in values.split(',')))
+        setattr(namespace, self.dest, kv)
 
 
-class CW(object):
-    def __init__(self, namespace, base_name, dimensions=None, test=False):
-        self.namespace = namespace
-        self.base_name = base_name
-        self.dimensions = dimensions
-
-        if test:
-            self.client = TestClient()
-        else:
-            session = botocore.session.get_session()
-            self.client = session.create_client('cloudwatch')
-
-    def push(self, value, suffix):
-        if suffix:
-            metric_name = self.base_name + '-' + suffix
-        else:
-            metric_name = self.base_name
-
-        args = {
-            'NameSpace': self.namespace,
-            'MetricName': metric_name,
-            'Value': value,
-        }
-        if self.dimensions:
-            args['Dimensions'] = self.dimensions
-        self.client.put_metric_data(**args)
-
-
-def strip_units(value):
-    '''
-    Strip unit characters from the end of value, leaving only the numeric data.
-    '''
-    while value[-1] not in '0123456789.':
-        value = value[:-1]
-    return value
-
-
-def parse_metrics(output):
-    metrics = {}
-    if '|' in output:
-        _, data = output.split('|', 2)
-
-        metric_tokens = data.strip().split()
-        for token in metric_tokens:
-            pair = token.split(';')[0]
-            key, value = pair.split('=')
-            metrics[key] = strip_units(value)
-
-    return metrics
-
-
-def cli():
+def cli(args=sys.argv[:]):
     usage = "%(prog)s [options] namespace base_name -- command"
     ap = ArgumentParser(usage=usage, description=__doc__)
-    ap.add_argument('--dimensions', metavar='key=value,key=value',
-                    help='CloudWatch metric dimensions')
+    ap.add_argument('--dimensions', metavar='key=value,key=value', default={},
+                    action=ParseKv, help='CloudWatch metric dimensions')
     ap.add_argument('--noop', action='store_true',
                     help='Don\'t push metrics, just log')
     ap.add_argument('namespace', help='CloudWatch namespace')
@@ -100,12 +54,14 @@ def cli():
         result = e.returncode
         output = e.output
 
-    cw = CW(args.namespace, args.base_name, args.dimensions, args.noop)
+    cw = aws.CW(args.namespace, args.base_name, args.dimensions, args.noop)
     if args.send_status:
-        cw.push(result, 'Status')
+        cw.add('Status', result)
     if args.send_perfdata:
-        for suffix, value in parse_metrics(output).iteritems():
-            cw.push(value, suffix)
+        for suffix, value in metrics.parse(output).iteritems():
+            cw.add(suffix, value)
+
+    cw.push()
 
 if __name__ == '__main__':
     cli()
